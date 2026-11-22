@@ -8,7 +8,7 @@ import { defineConfig } from "vite";
 // …then paste the returned database_id here. Until then, creating or
 // joining a room fails with "Room service is warming up" / 503, because
 // the lobby is stored in D1 (the Durable Object hydrates from it).
-const D1_PLACEHOLDER_ID = "00000000-0000-4000-8000-000000000000";
+const D1_PLACEHOLDER_ID = "fde4d1e8-596f-4730-90ac-70037f733ac4";
 
 const workerConfig = {
   main: "./worker/index.ts",
