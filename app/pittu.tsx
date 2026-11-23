@@ -2,7 +2,7 @@
 import {useEffect,useRef,useState} from 'react';
 import {ArrowRight,Volume2,VolumeX,HelpCircle,ArrowLeft,Copy,Check,Users,Play,X,RotateCcw,Link2,Camera} from 'lucide-react';
 import {createGame,player,start,step,command,clamp,findPassTarget,POWERUP_TYPES,TOWER_ZONE_RADIUS,waypoint,normalizeTeamSizes} from '../lib/game.js';
-import {createSnapshotBuffer,pushSnapshot,sampleRenderState,createServerClock,clockUpdate,clockNow,createInputLog,logInput,flushInputLog,replayLocal,mergeTick,predictStep,INTERP_DELAY_MS} from '../lib/netcode.js';
+import {createSnapshotBuffer,pushSnapshot,acceptFullState,sampleRenderState,createServerClock,clockUpdate,clockNow,createInputLog,logInput,flushInputLog,replayLocal,mergeTick,predictStep,INTERP_DELAY_MS} from '../lib/netcode.js';
 
 const LOOKS=[
  'Aarav · Boy (Striker)',
@@ -364,13 +364,16 @@ export default function Pittu(){
    }
    if(m.type==='state'||m.type==='hello'){
     if(mode.current==='online'&&session.current){
-     // Only accept in-order snapshots (tick + serverTime come from the
-     // server). A stale/out-of-order snapshot is dropped instead of
-     // snapping the game backwards.
+     // A full state is an authoritative transition, not a snapshot:
+     // acceptFullState takes it even when the server tick has not
+     // advanced since hello (tick stays 0 for the whole lobby phase).
+     // The old code dropped such states as "stale", which froze the
+     // lobby UI — team sizes never changed on screen and "Let's play"
+     // looked dead — even though the server had accepted the op.
      if(typeof m.tick==='number'&&typeof m.serverTime==='number'){
       if(!snapBufRef.current)snapBufRef.current=createSnapshotBuffer();
       if(!serverClockRef.current)serverClockRef.current=createServerClock();
-      if(!pushSnapshot(snapBufRef.current,{tick:m.tick,serverTime:m.serverTime,state:m.state}))return;
+      acceptFullState(snapBufRef.current,{tick:m.tick,serverTime:m.serverTime,state:m.state});
       clockUpdate(serverClockRef.current,m.serverTime,Date.now());
      }
      baseStateRef.current=m.state;

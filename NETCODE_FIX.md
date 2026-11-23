@@ -321,3 +321,86 @@ Key numbers (measured, not asserted):
 3. Held ball anchored to the local predicted hand (verified in
    `lib/world.js` hand-anchoring, see §3).
 4. `locationHint` on the create route, not just the WS join (see §4).
+
+## 8. v3.1 — the lobby freeze (2026-11-24, ~02:32–03:00 IST)
+
+Two NEW bugs, both introduced by v3.0, both found because Mohammad
+reported the lobby was unusable minutes after the v3 deploy — and both
+reproduced live in a fresh browser before the fix (room 4NL6JN).
+
+### 8.1 Bug A — the tick-0 stale drop froze the lobby (client)
+
+The server tick counter stays 0 for the whole lobby phase (it only
+increments once a round runs). The v3 client's `pushSnapshot` drops any
+snapshot whose tick is `<=` the last accepted tick. The `hello` message
+already used tick 0, so EVERY lobby broadcast after it — config acks,
+start acks, join updates — was dropped as "stale" before `accept()`
+ever ran. The lobby UI only ever showed the state from the HTTP join.
+
+Symptoms, exactly as reported and reproduced:
+- Team-size steppers and the 2v2 preset did nothing on screen (the
+  server accepted the config; the display never updated).
+- The first "Let's play" click DID start the round on the server, but
+  the screen threw the reply away and stayed in the lobby.
+- The second click then correctly failed with "A round is already
+  playing." — the server's phase was `opening` by then.
+
+Proven by simulation with the real `lib/netcode.js`: hello (tick 0)
+accepted, config ack (tick 0, 2v3) DROPPED, start ack (tick 0,
+`opening`) DROPPED, compact tick #1 accepted. D1 evidence: room
+DARA7E's checkpoint showed phase `lobby`, round 0, event 26 (many
+config attempts); FTJR69 event 8.
+
+Fix (`lib/netcode.js`, `app/pittu.tsx`): `acceptFullState()` — a full
+`state`/`hello` message is an authoritative transition, not a snapshot,
+so it is always accepted; when its tick did not advance, the
+interpolation history is re-based on it instead of dropping it. The
+strict stale guard stays for compact `tick` messages, where ordering
+is what keeps interpolation smooth. New test 11 in
+`scripts/test-netcode.mjs` covers it.
+
+### 8.2 Bug B — the setInterval tick never ran (server)
+
+v3.0 replaced v2's alarm-driven tick with a guarded in-memory
+`setInterval`, on the assumption that an open WebSocket keeps a
+Durable Object awake. It does not: a DO hibernates when idle, and
+`setInterval` does not wake it — Cloudflare's own guidance is to use
+alarms for periodic work in a DO. Evidence the interval never fired:
+- The browser repro watched 5+ seconds after a successful start and
+  the game screen never appeared (the tick-#1 heal never came).
+- D1 for the repro room 4NL6JN showed phase `lobby`, event 0,
+  clock 0, last updated at creation time — no checkpoint ever fired,
+  and `checkpointSoon()` runs on every game-phase tick.
+- v2's alarm tick demonstrably worked (matches ran, jittery but
+  playable); v3.0's interval tick produced no game-phase tick at all.
+
+Fix (`worker/room-do.ts`): the alarm IS the tick loop now — one alarm
+per tick, re-armed at the end of each tick (armed first, so a throw
+cannot break the chain), guarded by `alarmScheduled` so reconnects
+can never double-schedule it. `ensureTicking()` is called on WS
+connect, on every WS message and on every forwarded op, so the loop
+re-arms itself if the chain ever breaks. Each alarm runs
+`alarmTickSteps(elapsed)` fixed 50 ms steps (capped at 4) on the
+synthetic clock, so alarm stalls cost game time only beyond the cap
+and the game never runs fast. The tick path still does no awaited
+I/O; D1 checkpoints stay on `ctx.waitUntil()`.
+
+Also fixed in the same deploy: HTML documents are now served with
+`Cache-Control: no-store` (`worker/index.ts`), so a browser can never
+run a stale client against a new server after a deploy (the JS chunks
+are content-hashed and `immutable`, which is correct as-is). A cached
+v2 client would have ignored compact `tick` messages entirely, which
+matches the same frozen-lobby symptom and could not be ruled out for
+Mohammad's own session — he should hard-refresh once after this
+deploy.
+
+### 8.3 v3.1 tests (all pass)
+
+- New netcode test 11: full states accepted at a non-advancing tick
+  (hello, config ack 2v3, start ack all accepted; duplicate tick
+  still dropped).
+- Rewritten v3 stress check 1: 20 alarms with 50/100/150/200 ms gaps
+  — game clock tracks wall time EXACTLY (2.50 s), player position
+  matches the clock exactly; `alarmTickSteps(500) === 4` (cap holds).
+- Full `npm test` green (game, regressions, realtime, netcode,
+  repro-jitter, v3 stress, assets).

@@ -9,16 +9,16 @@
 // New architecture (v3 — see NETCODE_FIX.md):
 //  * Room state lives IN MEMORY in this object (this.game), not in D1.
 //  * Clients connect over WebSocket and send inputs fire-and-forget.
-//  * A server-side 20 Hz tick — a guarded in-memory setInterval(),
-//    fixed 50 ms steps on a synthetic clock — calls advance() and
-//    broadcasts to every connected socket. No client ever waits for a
-//    reply to its input, and there is no revision race: inputs are
-//    applied serially inside this single object.
-//  * alarm() is NOT the tick loop any more (v2 used it; every setAlarm
-//    is a durable storage write with best-effort timing, so ticks
-//    stalled). It is only a 60 s watchdog: if the interval ever dies
-//    while players are connected, the alarm restarts it.
-//  * The tick path does ZERO I/O: no setAlarm, no awaited D1 write.
+//  * A server-side 20 Hz tick — driven by Durable Object ALARMS
+//    (v3.1; v3.0 used setInterval, which never fired a single tick
+//    live because a hibernating DO is not woken by timers — alarms are
+//    the wake mechanism) — calls advance() and broadcasts to every
+//    connected socket. Each alarm runs as many fixed 50 ms steps as
+//    elapsed since the last alarm (capped at 4), so alarm stalls cost
+//    game time only beyond the cap. No client ever waits for a reply
+//    to its input, and there is no revision race: inputs are applied
+//    serially inside this single object.
+//  * The tick path does ZERO awaited I/O: no awaited D1 write.
 //    D1 checkpoints go through ctx.waitUntil() on discrete events
 //    (create/start/round end/lobby/leave) and at most once per 10 s.
 //  * D1 is only a backup: the lobby (create/join) is still created in
@@ -59,11 +59,9 @@ import {
   clamp,
   normalizeTeamSizes,
 } from '../lib/game.js';
-import { createInputQueue, queueInput, drainInputs, compactTick } from '../lib/netcode.js';
+import { createInputQueue, queueInput, drainInputs, compactTick, alarmTickSteps, TICK_MS } from '../lib/netcode.js';
 
-const TICK_MS = 50; // v3: 20 Hz fixed server tick, 1:1 with the 20 Hz client input
 const CHECKPOINT_MS = 10_000; // at most one D1 checkpoint per 10 s
-const WATCHDOG_MS = 60_000; // alarm() watchdog interval (recovery only)
 const ROOM_TTL_MS = 7_200_000; // 2 h, same as /api/room
 const VALID_OPS = new Set(['join', 'config', 'switchTeam', 'start', 'lobby', 'leave']);
 
@@ -128,7 +126,8 @@ export class PitthuRoom {
   private inputQueue: any = createInputQueue();
   private sockets: Set<any> = new Set();
   private socketPlayer: Map<any, string> = new Map();
-  private tickTimer: any = null; // v3: guarded in-memory interval (see startTickLoop)
+  private alarmScheduled: boolean = false; // v3.1: the alarm loop is armed
+  private lastTickWall: number = 0; // wall time of the last alarm, for catch-up steps
   private tickNow: number = 0; // synthetic tick clock (ms) — fixed 50 ms steps
   private lastCheckpoint: number = 0;
   private dirty: boolean = false;
@@ -193,56 +192,58 @@ export class PitthuRoom {
     }
   }
 
-  // ---- tick & broadcast (v3: in-memory setInterval, alarm = watchdog) ----
+  // ---- tick & broadcast (v3.1: ALARM-driven tick) ----
+  // v3 drove the tick with an in-memory setInterval(). That never ran a
+  // single tick live: a Durable Object hibernates when idle, and
+  // setInterval does not wake it — the lobby froze, the game screen
+  // never appeared, and no D1 checkpoint ever fired, while the round
+  // had actually started on the server. Cloudflare's own guidance is
+  // to use alarms for periodic work in a DO: an alarm wakes a
+  // hibernated object. So the alarm IS the tick loop now — one alarm
+  // per tick, re-armed at the end of each tick (armed FIRST, so a
+  // throw in the tick body cannot break the chain). Each alarm runs as
+  // many fixed 50 ms steps as elapsed since the last alarm (capped at
+  // 4), so alarm stalls cost game time only beyond the cap and the
+  // game never runs fast. The synthetic clock (tickNow += 50 per step)
+  // keeps the simulation deterministic. The tick path still does no
+  // awaited I/O: D1 checkpoints go through ctx.waitUntil().
 
-  private startTickLoop(): void {
-    // Guard: reconnects / simultaneous joins must never start two
-    // overlapping intervals (that would double the game speed).
-    if (this.tickTimer || !this.game) return;
-    this.tickNow = Date.now();
-    this.game.last = this.tickNow;
-    this.tickTimer = setInterval(() => this.tick(), TICK_MS);
-    // Watchdog: if the interval ever dies (isolate restart) while
-    // players are connected, alarm() restarts it within 60 s.
+  private ensureTicking(): void {
+    // Arm the alarm loop when there is a game and someone to broadcast
+    // to, and it is not already armed. Called on WS connect, on every
+    // WS message and on every forwarded op — the flag makes it a no-op
+    // when the loop is already running, so reconnects / simultaneous
+    // joins can never double-schedule it (that would double the game
+    // speed). If the alarm chain ever breaks (isolate restart), the
+    // next incoming message re-arms it.
+    if (!this.game || this.sockets.size === 0 || this.alarmScheduled) return;
+    if (!this.tickNow) {
+      this.tickNow = Date.now();
+      this.game.last = this.tickNow;
+    }
+    this.lastTickWall = Date.now();
+    this.alarmScheduled = true;
     try {
-      this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS).catch(() => {});
+      this.ctx.storage.setAlarm(Date.now() + TICK_MS).catch(() => {});
     } catch {
-      /* no storage in local dev */
+      /* no storage in local dev — the tick cannot run there */
     }
   }
 
-  private stopTickLoop(): void {
-    if (this.tickTimer) {
-      clearInterval(this.tickTimer);
-      this.tickTimer = null;
-    }
-  }
-
-  // Watchdog / cleanup only — NOT the tick loop (v2 used alarm() per
-  // tick; every setAlarm is a durable storage write with best-effort
-  // timing, so ticks stalled).
   async alarm(): Promise<void> {
+    this.alarmScheduled = false;
     if (!this.game || this.sockets.size === 0) {
       // No players left: checkpoint once and stop ticking until someone returns.
       await this.checkpoint(true);
       return;
     }
-    // Recovery: restart the interval if it died, and re-arm the watchdog.
-    if (!this.tickTimer) this.startTickLoop();
-    else {
-      try {
-        this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS).catch(() => {});
-      } catch {
-        /* no storage in local dev */
-      }
-    }
+    this.runTick();
+    // Re-arm FIRST so a throw above cannot break the chain; the flag
+    // guard in ensureTicking() prevents double-scheduling.
+    this.ensureTicking();
   }
 
-  private tick(): void {
-    if (!this.game || this.sockets.size === 0) {
-      this.stopTickLoop();
-      return;
-    }
+  private runTick(): void {
     const phase = this.game.phase;
     if (phase === 'opening' || phase === 'chase' || phase === 'result') {
       // Inputs are applied ONLY here, at the tick boundary, in
@@ -254,12 +255,24 @@ export class PitthuRoom {
         const pl = this.game.players.find((q: any) => q.id === playerId);
         if (pl) command(this.game, playerId, sanitizeInput(input, this.game, pl));
       }
-      this.tick++;
-      // Fixed 50 ms step on the synthetic clock: advance() sub-steps at
-      // 1/30 s internally, so a 50 ms tick is 1/30 + 1/60 — deterministic
-      // and independent of wall-clock jitter. (v2 passed Date.now().)
-      this.tickNow += TICK_MS;
-      advance(this.game, this.tickNow);
+      // Catch-up steps: alarms fire late (storage-write stalls), so run
+      // one fixed 50 ms step per 50 ms of wall time since the last
+      // alarm, capped at 4 — the game keeps real-time pace through
+      // ordinary stalls and degrades gracefully (runs slow, never fast)
+      // through long ones. (v3.0 ran exactly one step per setInterval
+      // callback, which assumed the callback fired on time.)
+      const now = Date.now();
+      const elapsed = this.lastTickWall ? now - this.lastTickWall : TICK_MS;
+      this.lastTickWall = now;
+      const steps = alarmTickSteps(elapsed);
+      for (let s = 0; s < steps; s++) {
+        this.tick++;
+        // Fixed 50 ms step on the synthetic clock: advance() sub-steps at
+        // 1/30 s internally, so a 50 ms tick is 1/30 + 1/60 — deterministic
+        // and independent of wall-clock jitter. (v2 passed Date.now().)
+        this.tickNow += TICK_MS;
+        advance(this.game, this.tickNow);
+      }
       this.revision++;
       this.broadcast();
       this.checkpointSoon();
@@ -463,9 +476,9 @@ export class PitthuRoom {
         }
       }
       start(g, body.fill !== false, g.teamSizes);
-      // Keep the synthetic tick clock authoritative when the loop runs;
-      // Date.now() only when the loop is not running yet (lobby).
-      g.last = this.tickTimer ? this.tickNow : Date.now();
+      // Keep the synthetic tick clock authoritative when the loop is
+      // armed; Date.now() only when it is not running yet (lobby).
+      g.last = this.tickNow ? this.tickNow : Date.now();
     } else if (op === 'lobby') {
       if (g.host !== me.id) throw new Error('Only the host can reset.');
       g.phase = 'lobby';
@@ -516,6 +529,9 @@ export class PitthuRoom {
         const out = this.doOp(op, body);
         this.broadcast();
         this.checkpointSoon();
+        // An op proves the object is awake: re-arm the alarm loop if it
+        // ever broke. No-op when it is already armed.
+        this.ensureTicking();
         return Response.json(out);
       } catch (e: any) {
         return Response.json({ error: e.message || 'Room operation failed.' }, { status: 400 });
@@ -550,7 +566,7 @@ export class PitthuRoom {
       this.sockets.add(server);
       this.socketPlayer.set(server, me.id);
       this.send(server, { type: 'hello', revision: this.revision, tick: this.tick, serverTime: Date.now(), ack: this.ackMap(), state: publicState(g) });
-      this.startTickLoop();
+      this.ensureTicking();
 
       server.addEventListener('message', (event: any) => {
         let msg: any;
@@ -569,7 +585,7 @@ export class PitthuRoom {
           if (msg.type === 'ping') {
             this.send(server, { type: 'pong', clientTime: msg.clientTime || 0, serverTime: Date.now() });
           } else if (msg.type === 'input' && msg.input && typeof msg.input === 'object') {
-            // v3 netcode: queue only. The next interval tick drains the
+            // v3 netcode: queue only. The next alarm tick drains the
             // queue in seq order and broadcasts once. The old code
             // applied the input here and broadcast actions immediately,
             // which could overtake the previous tick's snapshot and made
@@ -587,6 +603,10 @@ export class PitthuRoom {
             this.revision++;
             this.broadcast();
           }
+          // Any incoming message proves the object is awake: re-arm the
+          // alarm loop if it ever broke (isolate restart). No-op when
+          // it is already armed.
+          this.ensureTicking();
         } catch (e: any) {
           this.send(server, { type: 'error', error: e.message || 'Operation failed.' });
         }
@@ -602,7 +622,9 @@ export class PitthuRoom {
           this.revision++;
           this.broadcast();
           if (this.sockets.size === 0) {
-            this.stopTickLoop();
+            // No players left: the next alarm sees no sockets,
+            // checkpoints once and stops re-arming. No explicit stop
+            // needed — the alarm chain ends itself.
             try {
               this.ctx.waitUntil(this.checkpoint(true));
             } catch {

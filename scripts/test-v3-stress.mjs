@@ -24,7 +24,7 @@ import assert from 'node:assert/strict';
 import { createGame, player, start, command, advance, publicState } from '../lib/game.js';
 import {
   createInputLog, logInput, flushInputLog, replayLocal,
-  compactTick, mergeTick,
+  compactTick, mergeTick, alarmTickSteps,
 } from '../lib/netcode.js';
 
 // Deterministic pseudo-random so the run is reproducible.
@@ -49,35 +49,43 @@ function makeGame() {
   return { g, p, t0 };
 }
 
-// 1. v3 tick determinism under late callbacks.
-// The v3 tick steps a synthetic clock (tickNow += 50) instead of
-// passing Date.now() to advance(). Even if the interval callback fires
-// late (wall-clock jumps irregularly), the game advances exactly 50 ms
-// per tick and the player lands exactly where the ideal says.
+// 1. v3.1 alarm-driven tick determinism under late alarms.
+// The server tick is driven by Durable Object alarms (v3.0 used
+// setInterval, which never fired a single tick live — a hibernating DO
+// is not woken by timers). Alarms fire late, so each alarm runs as many
+// fixed 50 ms steps as elapsed since the last alarm (alarmTickSteps,
+// capped at 4). Alarm gaps here are exact multiples of 50 ms (50/100/
+// 150/200), so the game clock must track wall time EXACTLY; a 500 ms
+// gap then proves the cap (only 200 ms of game time — bounded loss,
+// never fast, never a spiral).
 {
   const { g, p, t0 } = makeGame();
-  const TICKS = 100;
+  const gaps = [50, 100, 150, 200, 50, 100, 150, 200, 50, 100, 150, 200, 50, 100, 150, 200, 50, 100, 150, 200];
   let tickNow = t0;
   let wallNow = t0;
-  let xAt50 = null;
-  for (let tick = 1; tick <= TICKS; tick++) {
-    // Client input every tick (straight run).
-    command(g, 'me', { seq: tick, round: g.round, mx: 1, mz: 0, ax: 1, az: 0, interact: false, charging: false, charge: 0, action: '' });
-    // v3 tick: fixed 50 ms step on the synthetic clock. The wall clock
-    // (when the callback actually fired) jumps irregularly — a late
-    // callback, a 120 ms stall, a quick one — but tickNow is unaffected.
-    tickNow += 50;
-    wallNow += 50 + Math.floor(rand() * 140) - 20; // callback 30-170 ms late/early
-    void wallNow; // wall time is deliberately NOT used by the tick
-    advance(g, tickNow);
-    if (tick === 50) xAt50 = p.x;
+  let tick = 0;
+  for (const gap of gaps) {
+    wallNow += gap;
+    const steps = alarmTickSteps(gap);
+    for (let s = 0; s < steps; s++) {
+      tick++;
+      command(g, 'me', { seq: tick, round: g.round, mx: 1, mz: 0, ax: 1, az: 0, interact: false, charging: false, charge: 0, action: '' });
+      tickNow += 50;
+      advance(g, tickNow);
+    }
   }
-  assert.ok(Math.abs(g.clock - 5.0) < 1e-9, `game clock must advance exactly 5.0s, got ${g.clock}`);
-  // 4.5 m/s * 50 ticks * 50 ms = 11.25 m from -4 -> 7.25 (before the
-  // court obstacle near x=8.7 stops the player).
-  assert.ok(Math.abs(xAt50 - 7.25) < 1e-9, `player must be at 7.25 after 50 ticks, got ${xAt50}`);
-  assert.ok(p.x > 8, `player must have run across the court, got ${p.x}`);
-  console.log('PASS v3 stress tick determinism: 100 late callbacks, clock exactly 5.000s');
+  const wallSecs = (wallNow - t0) / 1000;
+  assert.ok(Math.abs(g.clock - wallSecs) < 1e-9, `game clock must track wall time exactly, got ${g.clock} vs ${wallSecs}`);
+  // 4.5 m/s * wallSecs from -4 (before the court obstacle near x=8.7).
+  const expectX = -4 + 4.5 * wallSecs;
+  assert.ok(Math.abs(p.x - expectX) < 1e-9, `player must be at ${expectX}, got ${p.x}`);
+  // The cap: a 500 ms stall advances only 4 steps (200 ms) — bounded loss.
+  assert.equal(alarmTickSteps(500), 4, '500 ms gap capped at 4 steps');
+  assert.equal(alarmTickSteps(50), 1, '50 ms gap is 1 step');
+  assert.equal(alarmTickSteps(120), 2, '120 ms gap is 2 steps');
+  assert.equal(alarmTickSteps(0), 1, 'zero/negative gap is 1 step');
+  assert.equal(alarmTickSteps(-10), 1, 'negative gap is 1 step');
+  console.log(`PASS v3.1 stress alarm tick: ${gaps.length} alarms, clock exactly ${wallSecs.toFixed(2)}s, cap holds`);
 }
 
 // 2. Replay under stalls at 150 ms RTT, with a juke + Chappal Dash.

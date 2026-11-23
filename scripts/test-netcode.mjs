@@ -6,7 +6,7 @@ import {
   createServerClock, clockUpdate, clockNow,
   reconcileLocal, createInputQueue, queueInput, drainInputs,
   createInputLog, logInput, flushInputLog, replayLocal, predictStep,
-  compactTick, mergeTick,
+  compactTick, mergeTick, acceptFullState,
 } from '../lib/netcode.js';
 
 const snap = (tick, t, x) => ({ tick, serverTime: t, state: { phase: 'chase', players: [{ id: 'p1', x, z: 0 }], ball: { x: 0, z: 0 } } });
@@ -262,5 +262,27 @@ console.log('All netcode checks passed.');
   flushInputLog(log);
   assert.equal(log.inputs.length, 0, 'flush clears');
   console.log('PASS netcode input log cap + flush');
+}
+
+// 11. v3.1: full states are accepted even when the server tick has not
+// advanced (lobby broadcasts all carry tick 0 — the same tick as hello —
+// so the plain stale guard would drop every one: frozen lobby, "resize"
+// doing nothing on screen, "Let's play" looking dead). Compact ticks
+// keep the strict guard (test 1).
+{
+  const buf = createSnapshotBuffer();
+  const lobby0 = snap(0, 1000, 0); lobby0.state.phase = 'lobby'; lobby0.state.teamSizes = [3, 3];
+  assert.equal(acceptFullState(buf, lobby0), true, 'hello accepted');
+  assert.equal(buf.lastTick, 0);
+  const cfg = snap(0, 1200, 0); cfg.state.phase = 'lobby'; cfg.state.teamSizes = [2, 3];
+  assert.equal(acceptFullState(buf, cfg), true, 'same-tick config ack accepted, not dropped');
+  assert.equal(buf.snaps.length, 1, 'buffer re-based on the new state');
+  assert.deepEqual(buf.snaps[0].state.teamSizes, [2, 3]);
+  const start = snap(0, 1400, 0); start.state.phase = 'opening';
+  assert.equal(acceptFullState(buf, start), true, 'same-tick start ack accepted');
+  // A later compact tick with a higher tick still flows through the guard.
+  assert.equal(pushSnapshot(buf, snap(1, 1500, 0.225)), true, 'tick 1 accepted after re-base');
+  assert.equal(pushSnapshot(buf, snap(1, 1500, 0.225)), false, 'duplicate tick still dropped');
+  console.log('PASS netcode full states accepted at a non-advancing tick (lobby freeze fix)');
 }
 console.log('All v3 netcode checks passed.');

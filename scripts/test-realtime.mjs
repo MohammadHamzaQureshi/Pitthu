@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import {createGame, player, start, command, advance, publicState} from '../lib/game.js';
 
 let now = Date.now();
-const TICK_MS = 50; // 20 Hz server tick, as in PitthuRoom.startTickLoop()
+const TICK_MS = 50; // 20 Hz server tick, as in PitthuRoom's alarm-driven tick (v3.1)
 const INPUT_MS = 50; // 20 Hz client input, as in app/pittu.tsx
 
 // --- 1. Build a 3v3 room exactly as /api/room create + DO hydrate would ---

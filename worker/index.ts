@@ -58,7 +58,20 @@ const worker = {
       );
     }
 
-    return handler.fetch(request, env, ctx);
+    // HTML documents must never be cached: the JS chunks are content-
+    // hashed and immutable, but the HTML names them — a cached HTML
+    // after a deploy runs the OLD client against the NEW server, and the
+    // old client cannot read the new wire format (it ignores compact
+    // 'tick' messages), so the lobby freezes and "Let's play" looks dead
+    // while the server has actually started the round.
+    const res = await handler.fetch(request, env, ctx);
+    const ctype = res.headers.get('content-type') || '';
+    if (ctype.includes('text/html')) {
+      const h = new Headers(res.headers);
+      h.set('Cache-Control', 'no-store');
+      return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
+    }
+    return res;
   },
 };
 
