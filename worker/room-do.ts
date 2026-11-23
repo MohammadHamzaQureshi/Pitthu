@@ -6,20 +6,29 @@
 // input, so concurrent players collided with 409s and the game only advanced
 // when a request happened to arrive).
 //
-// New architecture:
+// New architecture (v3 — see NETCODE_FIX.md):
 //  * Room state lives IN MEMORY in this object (this.game), not in D1.
 //  * Clients connect over WebSocket and send inputs fire-and-forget.
-//  * A server-side 30 Hz tick (alarm(), every 33 ms) calls advance() and
-//    broadcasts the full public state to every connected socket. No client
-//    ever waits for a reply to its input, and there is no revision race:
-//    inputs are applied serially inside this single object.
-//  * D1 is only a backup: the lobby (create/join) is still created in D1
-//    by /api/room, this object hydrates from D1 on first use, and it
-//    checkpoints back to D1 at most every 10 s / on lobby & match end /
-//    when the last socket closes, so a DO eviction can re-hydrate.
-//  * Delta updates are future work — for now the tick broadcasts the full
-//    publicState(g) (same payload the old poller returned), which is small
-//    enough for 2v2–4v4 and far cheaper than a D1 write per input.
+//  * A server-side 20 Hz tick — a guarded in-memory setInterval(),
+//    fixed 50 ms steps on a synthetic clock — calls advance() and
+//    broadcasts to every connected socket. No client ever waits for a
+//    reply to its input, and there is no revision race: inputs are
+//    applied serially inside this single object.
+//  * alarm() is NOT the tick loop any more (v2 used it; every setAlarm
+//    is a durable storage write with best-effort timing, so ticks
+//    stalled). It is only a 60 s watchdog: if the interval ever dies
+//    while players are connected, the alarm restarts it.
+//  * The tick path does ZERO I/O: no setAlarm, no awaited D1 write.
+//    D1 checkpoints go through ctx.waitUntil() on discrete events
+//    (create/start/round end/lobby/leave) and at most once per 10 s.
+//  * D1 is only a backup: the lobby (create/join) is still created in
+//    D1 by /api/room, this object hydrates from D1 on first use, and it
+//    checkpoints back so a DO eviction can re-hydrate.
+//  * Broadcasts are compact tick updates (quantized arrays, no static
+//    fields) 20x/sec, with a full publicState() only on discrete
+//    transitions (hello, event/phase/round/scores change). Every
+//    broadcast carries `ack` (lastProcessedSeq per player) so clients
+//    can replay only their unacknowledged inputs.
 //
 // Wiring: vite.config.ts binds this class as PITTHU_ROOM
 // (durable_objects + migrations tag v1), worker/index.ts routes
@@ -32,8 +41,9 @@
 //   Client -> server: {type:'op', op:'config'|'switchTeam'|'start'|
 //                       'lobby'|'leave'|'join', ...lobby fields}
 //   Client -> server: {type:'leave'} | {type:'ping'}
-//   Server -> client: {type:'hello', revision, state}
-//   Server -> client: {type:'state', revision, state}
+//   Server -> client: {type:'hello', revision, tick, serverTime, ack, state}
+//   Server -> client: {type:'state', revision, tick, serverTime, ack, state}
+//   Server -> client: {type:'tick', tick, serverTime, ack, ...compact}
 //   Server -> client: {type:'error', error}
 //   Server -> client: {type:'pong'}
 // Auth is the same token scheme as /api/room: ?code=XXXXXX&token=<uuid>
@@ -49,11 +59,11 @@ import {
   clamp,
   normalizeTeamSizes,
 } from '../lib/game.js';
-import { createInputQueue, queueInput, drainInputs } from '../lib/netcode.js';
+import { createInputQueue, queueInput, drainInputs, compactTick } from '../lib/netcode.js';
 
-const TICK_MS = 33; // ~30 Hz server tick
-const IDLE_TICK_MS = 500; // lobby / match: no sim, just keep-alive checks
+const TICK_MS = 50; // v3: 20 Hz fixed server tick, 1:1 with the 20 Hz client input
 const CHECKPOINT_MS = 10_000; // at most one D1 checkpoint per 10 s
+const WATCHDOG_MS = 60_000; // alarm() watchdog interval (recovery only)
 const ROOM_TTL_MS = 7_200_000; // 2 h, same as /api/room
 const VALID_OPS = new Set(['join', 'config', 'switchTeam', 'start', 'lobby', 'leave']);
 
@@ -118,9 +128,16 @@ export class PitthuRoom {
   private inputQueue: any = createInputQueue();
   private sockets: Set<any> = new Set();
   private socketPlayer: Map<any, string> = new Map();
-  private alarmScheduled: boolean = false;
+  private tickTimer: any = null; // v3: guarded in-memory interval (see startTickLoop)
+  private tickNow: number = 0; // synthetic tick clock (ms) — fixed 50 ms steps
   private lastCheckpoint: number = 0;
   private dirty: boolean = false;
+  private lastBroadcastEvent: number = -1;
+  private lastBroadcastPhase: string = '';
+  private lastBroadcastRound: number = -1;
+  private lastBroadcastScores: string = '';
+  private lastBroadcastPowerups: string = '';
+  private lastBroadcastDecoys: string = '';
 
   constructor(ctx: any, env: any) {
     this.ctx = ctx;
@@ -159,61 +176,149 @@ export class PitthuRoom {
       .catch(() => {});
   }
 
-  // ---- tick & broadcast ----
-
-  private scheduleTick(delayMs: number): void {
-    if (this.alarmScheduled) return;
-    this.alarmScheduled = true;
-    this.ctx.storage.setAlarm(Date.now() + delayMs).catch(() => {
-      this.alarmScheduled = false;
-    });
+  // D1 checkpoints never block the tick: they run through waitUntil()
+  // on discrete events, throttled to once per 10 s. (v2 awaited
+  // checkpoint() inside alarm(); the throttle already limited real
+  // writes to 1/10 s, but the tick still awaited the check — v3 removes
+  // even that from the tick path.)
+  private checkpointSoon(): void {
+    if (!this.game || !this.code || !this.env.DB) return;
+    const now = Date.now();
+    if (now - this.lastCheckpoint < CHECKPOINT_MS) return;
+    this.lastCheckpoint = now;
+    try {
+      this.ctx.waitUntil(this.checkpoint(true));
+    } catch {
+      /* waitUntil unavailable (local dev) — checkpoint is best-effort */
+    }
   }
 
+  // ---- tick & broadcast (v3: in-memory setInterval, alarm = watchdog) ----
+
+  private startTickLoop(): void {
+    // Guard: reconnects / simultaneous joins must never start two
+    // overlapping intervals (that would double the game speed).
+    if (this.tickTimer || !this.game) return;
+    this.tickNow = Date.now();
+    this.game.last = this.tickNow;
+    this.tickTimer = setInterval(() => this.tick(), TICK_MS);
+    // Watchdog: if the interval ever dies (isolate restart) while
+    // players are connected, alarm() restarts it within 60 s.
+    try {
+      this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS).catch(() => {});
+    } catch {
+      /* no storage in local dev */
+    }
+  }
+
+  private stopTickLoop(): void {
+    if (this.tickTimer) {
+      clearInterval(this.tickTimer);
+      this.tickTimer = null;
+    }
+  }
+
+  // Watchdog / cleanup only — NOT the tick loop (v2 used alarm() per
+  // tick; every setAlarm is a durable storage write with best-effort
+  // timing, so ticks stalled).
   async alarm(): Promise<void> {
-    this.alarmScheduled = false;
     if (!this.game || this.sockets.size === 0) {
       // No players left: checkpoint once and stop ticking until someone returns.
       await this.checkpoint(true);
       return;
     }
+    // Recovery: restart the interval if it died, and re-arm the watchdog.
+    if (!this.tickTimer) this.startTickLoop();
+    else {
+      try {
+        this.ctx.storage.setAlarm(Date.now() + WATCHDOG_MS).catch(() => {});
+      } catch {
+        /* no storage in local dev */
+      }
+    }
+  }
+
+  private tick(): void {
+    if (!this.game || this.sockets.size === 0) {
+      this.stopTickLoop();
+      return;
+    }
     const phase = this.game.phase;
     if (phase === 'opening' || phase === 'chase' || phase === 'result') {
-      // V2 netcode: inputs are applied ONLY here, at the tick boundary,
-      // in per-player seq order — never on WS arrival. Applying on
-      // arrival made movement depend on network jitter (two inputs 5 ms
-      // apart moved the player by different amounts) and let an action
+      // Inputs are applied ONLY here, at the tick boundary, in
+      // per-player seq order — never on WS arrival. Applying on arrival
+      // made movement depend on network jitter (two inputs 5 ms apart
+      // moved the player by different amounts) and let an action
       // broadcast overtake the previous tick's state.
       for (const { playerId, input } of drainInputs(this.inputQueue)) {
         const pl = this.game.players.find((q: any) => q.id === playerId);
         if (pl) command(this.game, playerId, sanitizeInput(input, this.game, pl));
       }
       this.tick++;
-      advance(this.game, Date.now());
+      // Fixed 50 ms step on the synthetic clock: advance() sub-steps at
+      // 1/30 s internally, so a 50 ms tick is 1/30 + 1/60 — deterministic
+      // and independent of wall-clock jitter. (v2 passed Date.now().)
+      this.tickNow += TICK_MS;
+      advance(this.game, this.tickNow);
       this.revision++;
       this.broadcast();
-      await this.checkpoint();
-      this.scheduleTick(TICK_MS);
+      this.checkpointSoon();
     } else {
       // Lobby / match: nothing to simulate; broadcast only if something changed.
       if (this.dirty) {
         this.dirty = false;
         this.revision++;
         this.broadcast();
-        await this.checkpoint();
+        this.checkpointSoon();
       }
-      this.scheduleTick(IDLE_TICK_MS);
     }
+  }
+
+  private ackMap(): Record<string, number> {
+    // lastProcessedSeq per player = the seq command() last applied for
+    // them (game.js stores it on the player). Clients replay only
+    // inputs with seq > ack.
+    const ack: Record<string, number> = {};
+    for (const p of this.game.players) ack[p.id] = p.seq || 0;
+    return ack;
   }
 
   private broadcast(): void {
     if (!this.game) return;
-    const msg = JSON.stringify({
-      type: 'state',
-      revision: this.revision,
-      tick: this.tick,
-      serverTime: Date.now(),
-      state: publicState(this.game),
-    });
+    const g = this.game;
+    const scoresKey = `${g.scores?.[0] ?? 0},${g.scores?.[1] ?? 0}`;
+    const powerupsKey = (g.powerups || []).map((pu: any) => pu.uid || pu.id).join(',');
+    const decoysKey = (g.decoys || []).map((dc: any) => dc.id).join(',');
+    // Full state on hello-adjacent transitions (event/phase/round/
+    // scores change, or a powerup/decoy spawns/despawns — those carry
+    // display fields the tick only partially repeats); compact tick
+    // updates otherwise. The tick carries everything that changes per
+    // tick; static fields (names, teams, looks, teamSizes) come from
+    // the last full state on the client.
+    const full =
+      g.event !== this.lastBroadcastEvent ||
+      g.phase !== this.lastBroadcastPhase ||
+      g.round !== this.lastBroadcastRound ||
+      scoresKey !== this.lastBroadcastScores ||
+      powerupsKey !== this.lastBroadcastPowerups ||
+      decoysKey !== this.lastBroadcastDecoys;
+    this.lastBroadcastEvent = g.event;
+    this.lastBroadcastPhase = g.phase;
+    this.lastBroadcastRound = g.round;
+    this.lastBroadcastScores = scoresKey;
+    this.lastBroadcastPowerups = powerupsKey;
+    this.lastBroadcastDecoys = decoysKey;
+    const ack = this.ackMap();
+    const msg = full
+      ? JSON.stringify({
+          type: 'state',
+          revision: this.revision,
+          tick: this.tick,
+          serverTime: Date.now(),
+          ack,
+          state: publicState(g),
+        })
+      : JSON.stringify(compactTick(g, this.tick, Date.now(), ack));
     for (const ws of [...this.sockets]) {
       try {
         if (ws.readyState === 1) ws.send(msg);
@@ -358,7 +463,9 @@ export class PitthuRoom {
         }
       }
       start(g, body.fill !== false, g.teamSizes);
-      g.last = Date.now();
+      // Keep the synthetic tick clock authoritative when the loop runs;
+      // Date.now() only when the loop is not running yet (lobby).
+      g.last = this.tickTimer ? this.tickNow : Date.now();
     } else if (op === 'lobby') {
       if (g.host !== me.id) throw new Error('Only the host can reset.');
       g.phase = 'lobby';
@@ -408,7 +515,7 @@ export class PitthuRoom {
       try {
         const out = this.doOp(op, body);
         this.broadcast();
-        await this.checkpoint();
+        this.checkpointSoon();
         return Response.json(out);
       } catch (e: any) {
         return Response.json({ error: e.message || 'Room operation failed.' }, { status: 400 });
@@ -442,8 +549,8 @@ export class PitthuRoom {
       server.accept();
       this.sockets.add(server);
       this.socketPlayer.set(server, me.id);
-      this.send(server, { type: 'hello', revision: this.revision, tick: this.tick, serverTime: Date.now(), state: publicState(g) });
-      this.scheduleTick(TICK_MS);
+      this.send(server, { type: 'hello', revision: this.revision, tick: this.tick, serverTime: Date.now(), ack: this.ackMap(), state: publicState(g) });
+      this.startTickLoop();
 
       server.addEventListener('message', (event: any) => {
         let msg: any;
@@ -462,12 +569,12 @@ export class PitthuRoom {
           if (msg.type === 'ping') {
             this.send(server, { type: 'pong', clientTime: msg.clientTime || 0, serverTime: Date.now() });
           } else if (msg.type === 'input' && msg.input && typeof msg.input === 'object') {
-            // V2 netcode: queue only. The next alarm() tick drains the
+            // v3 netcode: queue only. The next interval tick drains the
             // queue in seq order and broadcasts once. The old code
             // applied the input here and broadcast actions immediately,
             // which could overtake the previous tick's snapshot and made
             // clients see states out of order. Cost: at most one extra
-            // tick (33 ms) of action latency — worth it for determinism.
+            // tick (50 ms) of action latency — worth it for determinism.
             // command() still drops stale/duplicate seqs at drain time.
             queueInput(this.inputQueue, meNow.id, msg.input);
           } else if (msg.type === 'op' && typeof msg.op === 'string') {
@@ -494,7 +601,14 @@ export class PitthuRoom {
           this.handleLeave(pid);
           this.revision++;
           this.broadcast();
-          if (this.sockets.size === 0) void this.checkpoint(true);
+          if (this.sockets.size === 0) {
+            this.stopTickLoop();
+            try {
+              this.ctx.waitUntil(this.checkpoint(true));
+            } catch {
+              void this.checkpoint(true);
+            }
+          }
         }
       });
       server.addEventListener('error', () => {

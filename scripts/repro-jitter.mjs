@@ -2,9 +2,9 @@
 // Simulates the exact old pipeline vs the new pipeline, with numbers.
 //
 // True motion: a player runs at 4.5 m/s (Pitthu chase speed, lib/game.js).
-// Server: snapshots every 33 ms. Network: 120 ms base delay + +/-30 ms
-// jitter (typical India mobile / home Wi-Fi to a far Durable Object).
-// Client renders at 60 fps.
+// Server: snapshots every 50 ms (v3: 20 Hz tick). Network: 120 ms base
+// delay + +/-30 ms jitter (typical India mobile / home Wi-Fi to a far
+// Durable Object). Client renders at 60 fps.
 //
 // OLD: render = latest snapshot received (what accept() did — snap).
 // NEW: render = interpolated at (latestServerTime - 100 ms).
@@ -35,7 +35,7 @@ function simulate(useInterp) {
       // (120ms +/-30ms) instead of reordering packets, which TCP forbids.
       delay = Math.max(90, Math.min(150, delay + (rand() * 20 - 10)));
       inFlight.push({ deliverAt: serverTime + delay, snap });
-      nextSnapAt += 33;
+      nextSnapAt += 50; // v3: 20 Hz tick
     }
     // Deliver arrived snapshots, in order (head of queue only).
     while (inFlight.length > 0 && inFlight[0].deliverAt <= now) {

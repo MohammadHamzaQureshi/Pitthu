@@ -2,8 +2,7 @@
 import {useEffect,useRef,useState} from 'react';
 import {ArrowRight,Volume2,VolumeX,HelpCircle,ArrowLeft,Copy,Check,Users,Play,X,RotateCcw,Link2,Camera} from 'lucide-react';
 import {createGame,player,start,step,command,clamp,findPassTarget,POWERUP_TYPES,TOWER_ZONE_RADIUS,waypoint,normalizeTeamSizes} from '../lib/game.js';
-import {blocked} from '../lib/navigation.js';
-import {createSnapshotBuffer,pushSnapshot,sampleRenderState,createServerClock,clockUpdate,clockNow,reconcileLocal,INTERP_DELAY_MS} from '../lib/netcode.js';
+import {createSnapshotBuffer,pushSnapshot,sampleRenderState,createServerClock,clockUpdate,clockNow,createInputLog,logInput,flushInputLog,replayLocal,mergeTick,predictStep,INTERP_DELAY_MS} from '../lib/netcode.js';
 
 const LOOKS=[
  'Aarav · Boy (Striker)',
@@ -46,41 +45,20 @@ function buildHudSignature(g:any,meId:string,localCharge:number){
  return `${g.phase}|${g.round}|${(g.teamSizes||[3,3]).join('v')}|${g.scores?.[0]}|${g.scores?.[1]}|${g.stack}|${g.attempts}|${Math.ceil(g.time||0)}|${Math.ceil(g.until||0)}|${Math.ceil(g.ready||0)}|${g.ball?.holder||''}|${g.striker||''}|${g.message||''}|${g.event||0}|${aliveMask}|${me?.carry??''}|${placeTick}|${nearLoose}|${inCenter}|${me?.inTowerZone?1:0}|${buffTick}|${effCharge}|${passId}`;
 }
 
-// Smooth 60fps visual dead-reckoning between 33ms server ticks in online
-// multiplayer. The server (PitthuRoom Durable Object) broadcasts state at
-// 30 Hz over WebSocket; this only fills in the gaps between broadcasts.
-function stepOnlineVisuals(g:any,meId:string,ctrl:any,dt:number){
- if(!g||!['opening','chase'].includes(g.phase)||(g.ready||0)>0)return;
- for(const p of g.players||[]){
-  if(!p.alive)continue;
-  const isMe=p.id===meId;
-  const mx=isMe?ctrl.mx:(p.mx||0),mz=isMe?ctrl.mz:(p.mz||0);
-  if(isMe&&(g.ball?.holder===meId||!Math.hypot(mx,mz))){
-   p.ax=ctrl.ax;p.az=ctrl.az;
-  }
-  if(g.phase==='chase'&&g.ball?.holder!==p.id&&(p.cool||0)<=0&&(p.anim||0)<=0&&!p.charging&&(p.stun||0)<=0){
-   let spd=p.carry!==null?3.95:4.5;
-   if(p.buff==='chappal')spd=6.2;
-   if(p.inTowerZone)spd*=0.58;
-   const nx=clamp(p.x+mx*spd*dt,-9.55,9.55),nz=clamp(p.z+mz*spd*dt,-6.05,6.05);
-   if(!blocked(nx,p.z))p.x=nx;
-   if(!blocked(p.x,nz))p.z=nz;
-   const ml=Math.hypot(mx,mz);
-   if(ml>0.12){p.ax=mx/ml;p.az=mz/ml;}
-   p.inTowerZone=p.team!==g.attack&&Math.hypot(p.x,p.z)<TOWER_ZONE_RADIUS;
-  }
- }
- if(g.ball?.mode==='flight'){
-  g.ball.x=clamp(g.ball.x+(g.ball.vx||0)*dt,-9.55,9.55);
-  g.ball.z=clamp(g.ball.z+(g.ball.vz||0)*dt,-6.05,6.05);
-  g.ball.travel=(g.ball.travel||0)+Math.hypot((g.ball.vx||0)*dt,(g.ball.vz||0)*dt);
- }
-}
+// v3: stepOnlineVisuals is GONE. It dead-reckoned every player on top of
+// the interpolated render copy (and world.js lerped them a third time),
+// which is why remote players drifted and doubled their smoothing. In
+// v3, remote players + ball are purely interpolated (the interpolation
+// itself is smooth per frame), and the local player is predicted via
+// predictStep()/replayLocal() in lib/netcode.js — never dead-reckoned
+// here. The ball in flight is interpolated like everything else; when
+// held, world.js anchors it to the holder's hand, so a ball held by the
+// local player follows the predicted hand, not the delayed snapshot.
 
 export default function Pittu(){
  const [screen,setScreen]=useState('home'),[ui,setUI]=useState<any>(null),[name,setName]=useState(''),[look,setLook]=useState(0),[teamSizes,setTeamSizes]=useState<number[]>([3,3]),[code,setCode]=useState(''),[join,setJoin]=useState(false),[help,setHelp]=useState(false),[muted,setMuted]=useState(false),[camMode,setCamMode]=useState<'auto'|'close'|'wide'>('auto'),[error,setError]=useState(''),[busy,setBusy]=useState(false),[loaded,setLoaded]=useState(false),[copied,setCopied]=useState(false),[fill,setFill]=useState(true),[connection,setConnection]=useState(''),[resume,setResume]=useState<any>(null),[isTouch,setIsTouch]=useState(false),[pingMs,setPingMs]=useState<number|null>(null);
  const teamSizesRef=useRef<number[]>([3,3]);teamSizesRef.current=teamSizes;
- const container=useRef<HTMLDivElement>(null),game=useRef<any>(null),mode=useRef('home'),session=useRef<any>(null),myId=useRef(''),controls=useRef<any>({mx:0,mz:0,ax:0,az:-1,interact:false,charging:false,charge:0,action:'',seq:0}),keys=useRef<any>({}),world=useRef<any>(null),sound=useRef<any>(null),isMuted=useRef(false),helpOpen=useRef(false),seenRound=useRef(-1),seenSfxSeq=useRef(0),chargeStartedAt=useRef<number>(0),lastChargeTick=useRef<number>(0),lastPlaceTick=useRef<number>(0),camModeRef=useRef<'auto'|'close'|'wide'>('auto'),lastUiKey=useRef<string>(''),wsRef=useRef<WebSocket|null>(null),wsRetryRef=useRef(0),wsTimerRef=useRef<any>(null),wsSendTimerRef=useRef<any>(null),wsEverConnectedRef=useRef(false),snapBufRef=useRef<any>(null),serverClockRef=useRef<any>(null),predictedPosRef=useRef<any>(null),pingTickRef=useRef(0);
+ const container=useRef<HTMLDivElement>(null),game=useRef<any>(null),mode=useRef('home'),session=useRef<any>(null),myId=useRef(''),controls=useRef<any>({mx:0,mz:0,ax:0,az:-1,interact:false,charging:false,charge:0,action:'',seq:0}),keys=useRef<any>({}),world=useRef<any>(null),sound=useRef<any>(null),isMuted=useRef(false),helpOpen=useRef(false),seenRound=useRef(-1),seenSfxSeq=useRef(0),chargeStartedAt=useRef<number>(0),lastChargeTick=useRef<number>(0),lastPlaceTick=useRef<number>(0),camModeRef=useRef<'auto'|'close'|'wide'>('auto'),lastUiKey=useRef<string>(''),wsRef=useRef<WebSocket|null>(null),wsRetryRef=useRef(0),wsTimerRef=useRef<any>(null),wsSendTimerRef=useRef<any>(null),wsEverConnectedRef=useRef(false),snapBufRef=useRef<any>(null),serverClockRef=useRef<any>(null),predictedPlayerRef=useRef<any>(null),pendingInputsRef=useRef<any>(null),baseStateRef=useRef<any>(null),pingTickRef=useRef(0);
  const stickKnob=useRef<HTMLSpanElement>(null),aimKnob=useRef<HTMLSpanElement>(null),cancelBtnRef=useRef<HTMLButtonElement>(null),joystick=useRef<any>(null),aimStart=useRef<any>(null),touchInteract=useRef(false),touchInteractId=useRef<number|null>(null);
  if(!game.current)game.current=demo();helpOpen.current=help;
 
@@ -314,19 +292,33 @@ export default function Pittu(){
    syncKeyboardMotion();
   }
  }
- function accept(g:any){
-  const oldRound=game.current?.round;
+ function accept(g:any,ack?:any){
+  const oldRound=game.current?.round,oldPhase=game.current?.phase;
   syncRound(g);
   if(g.teamSizes)setTeamSizes(normalizeTeamSizes(g.teamSizes,[3,3]));
-  // V2 netcode: reconcile the locally predicted position with the
-  // authoritative one instead of snapping the render to it. Small
-  // errors (<15 cm) are kept, medium ones blended, only large ones snap.
-  // A round change resets prediction to the authoritative spawn.
+  // v3 netcode: proper client-side prediction + input replay. The server
+  // echoes lastProcessedSeq (ack) per player; the client replays only
+  // its unacknowledged inputs from the authoritative position through
+  // the exact server step. The replayed position IS the present-tense
+  // estimate — the gap to the authoritative position is expected
+  // latency, not an error, so nothing is blended or snapped back.
+  // (v2 compared the current prediction directly against the ~RTT-old
+  // snapshot and treated the latency gap as an error — the rubber-band.)
+  // A round/phase change, death or stun flushes the pending inputs and
+  // resets the prediction to the authoritative spawn/position.
   const authMe=g.players?.find((q:any)=>q.id===myId.current);
   if(authMe){
-   if(oldRound!==undefined&&g.round!==oldRound)predictedPosRef.current={x:authMe.x,z:authMe.z};
-   else if(predictedPosRef.current)predictedPosRef.current=reconcileLocal(predictedPosRef.current,authMe);
-   else predictedPosRef.current={x:authMe.x,z:authMe.z};
+   const reset=oldRound!==undefined&&(g.round!==oldRound||g.phase!==oldPhase)||!authMe.alive||(authMe.stun||0)>0;
+   if(reset){
+    if(pendingInputsRef.current)flushInputLog(pendingInputsRef.current);
+    predictedPlayerRef.current={...authMe};
+   }else if(predictedPlayerRef.current&&pendingInputsRef.current){
+    const ackSeq=ack?.[myId.current]??authMe.seq??0;
+    predictedPlayerRef.current=replayLocal(authMe,g,pendingInputsRef.current,ackSeq);
+   }else{
+    if(!pendingInputsRef.current)pendingInputsRef.current=createInputLog();
+    predictedPlayerRef.current={...authMe};
+   }
   }
   game.current=g;
   lastUiKey.current=buildHudSignature(g,myId.current,controls.current.charge||0);
@@ -355,18 +347,34 @@ export default function Pittu(){
   ws.onmessage=(ev)=>{
    let m:any;try{m=JSON.parse(ev.data);}catch{return;}
    if(m.type==='pong'&&typeof m.clientTime==='number'){setPingMs(Math.max(0,Math.round(Date.now()-m.clientTime)));return;}
+   if(m.type==='tick'&&typeof m.tick==='number'&&typeof m.serverTime==='number'){
+    // v3 compact tick: merge into the last full state, then treat the
+    // merged state exactly like a snapshot (stale guard + clock + accept).
+    if(mode.current==='online'&&session.current&&baseStateRef.current){
+     if(!snapBufRef.current)snapBufRef.current=createSnapshotBuffer();
+     if(!serverClockRef.current)serverClockRef.current=createServerClock();
+     const merged=mergeTick(baseStateRef.current,m);
+     if(!merged)return;
+     baseStateRef.current=merged;
+     if(!pushSnapshot(snapBufRef.current,{tick:m.tick,serverTime:m.serverTime,state:merged}))return;
+     clockUpdate(serverClockRef.current,m.serverTime,Date.now());
+     accept(merged,m.ack);setConnection('');
+    }
+    return;
+   }
    if(m.type==='state'||m.type==='hello'){
     if(mode.current==='online'&&session.current){
-     // V2 netcode: only accept in-order snapshots (tick + serverTime
-     // now come from the server). A stale/out-of-order snapshot is
-     // dropped instead of snapping the game backwards.
+     // Only accept in-order snapshots (tick + serverTime come from the
+     // server). A stale/out-of-order snapshot is dropped instead of
+     // snapping the game backwards.
      if(typeof m.tick==='number'&&typeof m.serverTime==='number'){
       if(!snapBufRef.current)snapBufRef.current=createSnapshotBuffer();
       if(!serverClockRef.current)serverClockRef.current=createServerClock();
       if(!pushSnapshot(snapBufRef.current,{tick:m.tick,serverTime:m.serverTime,state:m.state}))return;
       clockUpdate(serverClockRef.current,m.serverTime,Date.now());
      }
-     accept(m.state);setConnection('');
+     baseStateRef.current=m.state;
+     accept(m.state,m.ack);setConnection('');
     }
    }
    else if(m.type==='error'){setConnection(m.error||'Realtime error.');}
@@ -422,7 +430,7 @@ export default function Pittu(){
    try{accept((await api('switchTeam')).state);}catch(e:any){setError(e.message);}
   }
  }
- async function online(op:string,rejoin?:any){setBusy(true);setError('');try{if(rejoin)session.current=rejoin;const r=await api(op,{name:name||'Neighbour',look,teamSizes:teamSizesRef.current,code:rejoin?.code||code});session.current={code:r.state.code,token:r.token||session.current?.token,id:r.id||session.current?.id};myId.current=session.current.id;sessionStorage.setItem('pittu-session',JSON.stringify(session.current));controls.current.seq=Math.max(controls.current.seq,r.state.players.find((p:any)=>p.id===myId.current)?.seq+1||0);seenSfxSeq.current=r.state.sfxSeq||0;mode.current='online';setScreen(r.state.phase==='lobby'?'lobby':'play');accept(r.state);setResume(null);connectWs();}catch(e:any){setError(e.message);if(rejoin){sessionStorage.removeItem('pittu-session');session.current=null;setResume(null);}}finally{setBusy(false);}}
+ async function online(op:string,rejoin?:any){setBusy(true);setError('');try{if(rejoin)session.current=rejoin;const r=await api(op,{name:name||'Neighbour',look,teamSizes:teamSizesRef.current,code:rejoin?.code||code});session.current={code:r.state.code,token:r.token||session.current?.token,id:r.id||session.current?.id};myId.current=session.current.id;sessionStorage.setItem('pittu-session',JSON.stringify(session.current));controls.current.seq=Math.max(controls.current.seq,r.state.players.find((p:any)=>p.id===myId.current)?.seq+1||0);seenSfxSeq.current=r.state.sfxSeq||0;mode.current='online';setScreen(r.state.phase==='lobby'?'lobby':'play');if(pendingInputsRef.current)flushInputLog(pendingInputsRef.current);predictedPlayerRef.current=null;baseStateRef.current=null;accept(r.state);setResume(null);connectWs();}catch(e:any){setError(e.message);if(rejoin){sessionStorage.removeItem('pittu-session');session.current=null;setResume(null);}}finally{setBusy(false);}}
  function practice(){const ts=normalizeTeamSizes(teamSizesRef.current,[3,3]);const g=createGame('PRACTICE',ts);g.targetRounds=6;g.maxRounds=8;g.roundDuration=75;const p={...player('you',name||'Aarav',0),look};g.players=[p];g.host=p.id;start(g,true,ts);g.ready=1.2;game.current=g;myId.current='you';session.current=null;mode.current='practice';chargeStartedAt.current=0;seenRound.current=g.round;seenSfxSeq.current=g.sfxSeq||0;controls.current={mx:0,mz:0,ax:0,az:-1,interact:false,charging:false,charge:0,action:'',seq:0};lastUiKey.current=buildHudSignature(g,'you',0);setScreen('play');setUI({...g});setError('');playSfx('whistle');}
  async function leave(){
   // Closing the socket tells the Durable Object to convert the player to
@@ -499,6 +507,12 @@ export default function Pittu(){
     smoothDt=Math.abs(rawDt-smoothDt)>0.018?rawDt:(smoothDt*0.8+rawDt*0.2);
     const dt=smoothDt;
     syncKeyboardMotion();
+    // v3: one-shot actions (throw/pass/interact/drop/cancel) flush
+    // immediately instead of waiting for the next 50ms sender tick —
+    // the frame loop runs every ~16ms, so an action set by any key,
+    // mouse or touch handler is sent within one frame. (The 50ms
+    // sender still carries the regular movement inputs.)
+    if(mode.current==='online'&&controls.current.action&&wsRef.current?.readyState===WebSocket.OPEN)sendInputNow();
     if(chargeStartedAt.current>0&&game.current?.ball?.holder===myId.current&&!aimStart.current?.canceled){
      const meP=game.current?.players?.find((p:any)=>p.id===myId.current);
      const cDur=meP?.buff==='banta'?225:620;
@@ -534,17 +548,24 @@ export default function Pittu(){
      const renderTime=clockNow(serverClockRef.current,Date.now())-INTERP_DELAY_MS;
      const sampled=sampleRenderState(snapBufRef.current,renderTime);
      if(sampled.state){
-      // Deep-enough copy: fresh player objects so stepOnlineVisuals /
-      // world lerp never mutate the authoritative snapshot.
-      renderGame={...sampled.state,players:(sampled.state.players||[]).map((q:any)=>({...q})),ball:sampled.state.ball?{...sampled.state.ball}:sampled.state.ball};
-      const meR=renderGame.players.find((q:any)=>q.id===myId.current);
-      if(meR&&predictedPosRef.current){meR.x=predictedPosRef.current.x;meR.z=predictedPosRef.current.z;}
-      // Re-apply local dead-reckoning to the render copy only.
-      stepOnlineVisuals(renderGame,myId.current,controls.current,dt);
-      // stepOnlineVisuals moved the render copy's local player from the
-      // predicted position; keep predictedPosRef in sync with it.
-      const meR2=renderGame.players.find((q:any)=>q.id===myId.current);
-      if(meR2)predictedPosRef.current={x:meR2.x,z:meR2.z};
+      // v3: strict separation. Remote players + ball are PURELY
+      // interpolated (no dead-reckoning, no extra lerp — the
+      // interpolation itself is smooth per frame). The local player is
+      // the predicted position (never delayed by the 100ms buffer).
+      // _interp marks remote players so world.js sets their visual root
+      // directly instead of lerping on top of the interpolation.
+      // Fresh player objects so nothing here mutates the snapshot.
+      const pp=predictedPlayerRef.current;
+      renderGame={...sampled.state,players:(sampled.state.players||[]).map((q:any)=>{
+       if(q.id===myId.current){
+        return pp?{...q,x:pp.x,z:pp.z,ax:pp.ax,az:pp.az}:{...q};
+       }
+       return {...q,_interp:true};
+      }),ball:sampled.state.ball?{...sampled.state.ball}:sampled.state.ball};
+      // Held ball: world.js anchors the ball mesh to the holder's hand,
+      // and the local player's hand is at the predicted position — so a
+      // ball held by the local player follows the predicted hand, not
+      // the ~100ms-delayed ball snapshot. Nothing extra needed here.
      }
     }
     w.update(renderGame,myId.current,now/1000,dt);
@@ -615,12 +636,33 @@ export default function Pittu(){
   return()=>{gone=true;cancelAnimationFrame(raf);world.current?.dispose();window.removeEventListener('keydown',down);window.removeEventListener('keyup',up);window.removeEventListener('blur',blur);window.removeEventListener('pointerup',globalPointerUp);window.removeEventListener('pointercancel',globalPointerUp);};
  },[]);
 
+ // v3: send one input immediately (shared by the 50ms sender below and
+ // the one-shot flush in the frame loop). Steps the local prediction by
+ // the exact same input (command() + one 50ms movePlayerStep() via
+ // predictStep — the same code path the server runs) and remembers the
+ // input so a later snapshot can replay it. A one-shot action is
+ // cleared ONLY after a successful send, so it survives a dropped
+ // socket and fires on reconnect instead of being lost.
+ function sendInputNow(){
+  if(mode.current!=='online'||!session.current||!game.current)return false;
+  const ws=wsRef.current;
+  if(!ws||ws.readyState!==WebSocket.OPEN)return false;
+  const sentAction=controls.current.action;
+  const input={...controls.current,action:sentAction,seq:++controls.current.seq,round:game.current.round};
+  try{ws.send(JSON.stringify({type:'input',input}));}
+  catch{return false;}
+  controls.current.action='';
+  if(!pendingInputsRef.current)pendingInputsRef.current=createInputLog();
+  logInput(pendingInputsRef.current,input);
+  const pp=predictedPlayerRef.current;
+  if(pp&&game.current)predictStep(pp,game.current,input);
+  return true;
+ }
+
  useEffect(()=>{
   // Realtime input sender: every 50ms (20 Hz), fire-and-forget over the
   // WebSocket. Nothing is awaited, so input latency is one WS frame, not
-  // a 90ms poll + round-trip + D1 write. A one-shot action (throw/pass/
-  // interact) is cleared ONLY after a successful send, so it survives a
-  // dropped socket and fires on reconnect instead of being lost.
+  // a 90ms poll + round-trip + D1 write.
   // Solo/practice mode is untouched — it steps locally in the frame loop.
   const t=setInterval(()=>{
    if(mode.current!=='online'||!session.current||!game.current)return;
@@ -628,10 +670,7 @@ export default function Pittu(){
    if(!ws||ws.readyState!==WebSocket.OPEN){if(!wsRef.current)connectWs();return;}
    syncKeyboardMotion();
    if(++pingTickRef.current>=20){pingTickRef.current=0;try{ws.send(JSON.stringify({type:'ping',clientTime:Date.now()}));}catch{}}
-   const sentAction=controls.current.action;
-   const input={...controls.current,action:sentAction,seq:++controls.current.seq,round:game.current.round};
-   try{ws.send(JSON.stringify({type:'input',input}));controls.current.action='';}
-   catch{/* keep the action; it retries on the next 50ms tick */}
+   sendInputNow();
   },50);
   wsSendTimerRef.current=t;
   return()=>{clearInterval(t);};

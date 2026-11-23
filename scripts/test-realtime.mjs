@@ -1,6 +1,6 @@
 // Realtime multiplayer invariants — no deps, no network, no Cloudflare.
 // The PitthuRoom Durable Object (worker/room-do.ts) is a thin shell around
-// lib/game.js: in-memory state + a 30 Hz advance() tick + broadcast.
+// lib/game.js: in-memory state + a 20 Hz advance() tick + broadcast.
 // This test proves the simulation the DO drives behaves correctly under
 // that tick/input pattern, and that the old polling failure mode (inputs
 // applied via competing D1 writes with revision conflicts) cannot happen
@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import {createGame, player, start, command, advance, publicState} from '../lib/game.js';
 
 let now = Date.now();
-const TICK_MS = 33; // 30 Hz server tick, as in PitthuRoom.alarm()
+const TICK_MS = 50; // 20 Hz server tick, as in PitthuRoom.startTickLoop()
 const INPUT_MS = 50; // 20 Hz client input, as in app/pittu.tsx
 
 // --- 1. Build a 3v3 room exactly as /api/room create + DO hydrate would ---
@@ -25,12 +25,14 @@ start(g, true, [3, 3]);
 assert.equal(g.players.length, 6, 'bots fill both teams to 3v3');
 assert.equal(g.phase, 'opening');
 
-// --- 2. Drive the 30 Hz tick for 10 simulated seconds, inputs at 20 Hz ---
+// --- 2. Drive the 20 Hz tick for 10 simulated seconds, inputs at 20 Hz ---
 let ticks = 0, inputs = 0, lastDigest = '';
 const seq = {'host-1': 0, 'guest-1': 0};
 for (let t = 0; t < 10_000; t += TICK_MS) {
   now += TICK_MS;
   // Inputs arrive between ticks; command() drops stale/duplicate seqs.
+  // v3: the 20 Hz tick and the 20 Hz input are 1:1, so every tick gets
+  // exactly one fresh input per player.
   if (t % INPUT_MS < TICK_MS) {
     for (const [id, mx] of [['host-1', 1], ['guest-1', -1]]) {
       command(g, id, {seq: ++seq[id], round: g.round, mx, mz: 0, ax: mx, az: 0,
@@ -40,10 +42,10 @@ for (let t = 0; t < 10_000; t += TICK_MS) {
   }
   const before = g.clock;
   advance(g, now);
-  // With a 33 ms tick the advance() 0.5 s clamp is never hit, so no
+  // With a 50 ms tick the advance() 0.5 s clamp is never hit, so no
   // simulated time is silently dropped (the old poller lost time whenever
   // a poll was delayed > 500 ms).
-  assert.ok(g.clock - before <= 0.034 + 1e-9, `tick advanced ${(g.clock - before).toFixed(3)}s, clamp hit`);
+  assert.ok(g.clock - before <= 0.051 + 1e-9, `tick advanced ${(g.clock - before).toFixed(3)}s, clamp hit`);
   ticks++;
   const st = publicState(g);
   // Broadcast payload never leaks tokens, and always carries a digest.
@@ -51,9 +53,9 @@ for (let t = 0; t < 10_000; t += TICK_MS) {
   assert.ok(st.players.every((p) => !('token' in p)), 'publicState strips player tokens');
   lastDigest = st.digest;
 }
-assert.ok(ticks >= 300, `expected >=300 ticks in 10s, got ${ticks}`);
+assert.ok(ticks >= 190, `expected >=190 ticks in 10s, got ${ticks}`);
 assert.ok(inputs >= 350, `expected >=350 inputs in 10s, got ${inputs}`);
-console.log(`PASS realtime tick: ${ticks} ticks @30Hz, ${inputs} inputs @20Hz, no dropped time`);
+console.log(`PASS realtime tick: ${ticks} ticks @20Hz, ${inputs} inputs @20Hz, no dropped time`);
 
 // --- 3. Stale / duplicate inputs are dropped (same guard the DO relies on) ---
 const p = g.players.find((x) => x.id === 'host-1');
@@ -70,7 +72,7 @@ const holder = g.players.find((x) => x.id === g.ball?.holder) || g.players[0];
 // strike: give the striker the ball and let the bots play a few seconds.
 for (let i = 0; i < 200; i++) { now += TICK_MS; advance(g, now); }
 assert.ok(['opening', 'chase', 'result'].includes(g.phase), `phase is ${g.phase}`);
-console.log(`PASS realtime sim: after 10s+ of 30Hz ticks phase=${g.phase} round=${g.round} digest=${lastDigest}`);
+console.log(`PASS realtime sim: after 10s+ of 20Hz ticks phase=${g.phase} round=${g.round} digest=${lastDigest}`);
 
 // --- 5. WS protocol shape (what the client sends / server broadcasts) ---
 const wsInput = JSON.stringify({type: 'input', input: {seq: 42, round: 0, mx: 1, mz: 0, ax: 1, az: 0, interact: false, charging: false, charge: 0, action: 'throw'}});

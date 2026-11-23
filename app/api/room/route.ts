@@ -25,20 +25,42 @@ const ROOM_TTL_MS=7200000;
 const json=(o:any,status=200)=>Response.json(o,{status,headers:SEC_HEADERS});
 
 // --- Durable Object forwarding (single authority once the DO owns a room) ---
-function roomStub(code:string){
+// v3: pin the Durable Object near the player who first touches the room.
+// Cloudflare only honors { locationHint } on the FIRST get() that
+// instantiates the object for a room code — later get() calls ignore it.
+// The first touch is usually the creator's WebSocket upgrade
+// (worker/index.ts, which also passes the hint) or the first lobby op
+// forwarded here, so the hint is passed at BOTH places, derived from
+// the request's Cloudflare metadata (req.cf.continent). 'AS' -> 'apac'
+// is the one that matters for this game's players (India).
+function locationHintForCf(cf:any):string|undefined{
+ const c=typeof cf?.continent==='string'?cf.continent:'';
+ if(c==='AS')return 'apac';
+ if(c==='NA')return 'enam';
+ if(c==='SA')return 'sam';
+ if(c==='EU')return 'weur';
+ if(c==='AF')return 'afr';
+ if(c==='OC')return 'oc';
+ return undefined;
+}
+function roomStub(code:string,req?:Request){
  const ns=(env as any).PITTHU_ROOM;
  if(!ns)return null;
- try{return ns.get(ns.idFromName(code));}catch{return null;}
+ try{
+  const hint=locationHintForCf((req as any)?.cf);
+  const id=ns.idFromName(code);
+  return hint?ns.get(id,{locationHint:hint}):ns.get(id);
+ }catch{return null;}
 }
-async function doIsLoaded(code:string):Promise<boolean>{
- const stub=roomStub(code);if(!stub)return false;
+async function doIsLoaded(code:string,req?:Request):Promise<boolean>{
+ const stub=roomStub(code,req);if(!stub)return false;
  try{
   const r=await stub.fetch(new Request(`http://pitthu-room/loaded?code=${code}`));
   const d:any=await r.json();return !!d.loaded;
  }catch{return false;}
 }
-async function forwardToDO(code:string,body:any){
- const stub=roomStub(code);if(!stub)return null;
+async function forwardToDO(code:string,body:any,req?:Request){
+ const stub=roomStub(code,req);if(!stub)return null;
  const r=await stub.fetch(new Request(`http://pitthu-room/op?code=${code}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}));
  const d:any=await r.json().catch(()=>({error:'Room service is unavailable.'}));
  return json(d,r.status);
@@ -88,8 +110,8 @@ export async function POST(req:Request){
   // it instead of mutating the stale D1 copy. If the DO is unreachable,
   // fall through to the legacy D1 path below.
   try{
-   if(await doIsLoaded(code)){
-    const forwarded=await forwardToDO(code,body);
+   if(await doIsLoaded(code,req)){
+    const forwarded=await forwardToDO(code,body,req);
     if(forwarded)return forwarded;
    }
   }catch(e:any){console.error('room DO forward',e.message);}

@@ -5,6 +5,26 @@ import handler from "vinext/server/fetch-handler";
 // (durable_objects: PITTHU_ROOM -> PitthuRoom, migrations tag v1).
 export { PitthuRoom } from "./room-do";
 
+// v3: pin the Durable Object near the player who first touches the room.
+// Cloudflare only honors { locationHint } on the FIRST get() that
+// instantiates the object for a room code — later get() calls ignore it.
+// The creator's WebSocket upgrade is usually that first touch (the
+// lobby API's roomStub is the other one — see app/api/room/route.ts),
+// so the hint is passed at BOTH places, derived from the request's
+// Cloudflare metadata (request.cf.continent). 'AS' -> 'apac' is the one
+// that matters for this game's players (India); the rest are mapped for
+// completeness. Undefined = let Cloudflare choose.
+function locationHintForCf(cf: any): string | undefined {
+  const c = typeof cf?.continent === "string" ? cf.continent : "";
+  if (c === "AS") return "apac";
+  if (c === "NA") return "enam";
+  if (c === "SA") return "sam";
+  if (c === "EU") return "weur";
+  if (c === "AF") return "afr";
+  if (c === "OC") return "oc";
+  return undefined;
+}
+
 const worker = {
   async fetch(request: Request, env: Cloudflare.Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
@@ -29,7 +49,8 @@ const worker = {
         );
       }
       const id = env.PITTHU_ROOM.idFromName(code);
-      const stub = env.PITTHU_ROOM.get(id);
+      const hint = locationHintForCf((request as any).cf);
+      const stub = hint ? env.PITTHU_ROOM.get(id, { locationHint: hint }) : env.PITTHU_ROOM.get(id);
       // Forward the upgrade request verbatim (Upgrade headers included);
       // the Durable Object answers 101 and owns the socket from there.
       return stub.fetch(
