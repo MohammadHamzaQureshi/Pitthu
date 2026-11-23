@@ -49,6 +49,7 @@ import {
   clamp,
   normalizeTeamSizes,
 } from '../lib/game.js';
+import { createInputQueue, queueInput, drainInputs } from '../lib/netcode.js';
 
 const TICK_MS = 33; // ~30 Hz server tick
 const IDLE_TICK_MS = 500; // lobby / match: no sim, just keep-alive checks
@@ -113,6 +114,8 @@ export class PitthuRoom {
   private game: any = null;
   private code: string = '';
   private revision: number = 0;
+  private tick: number = 0;
+  private inputQueue: any = createInputQueue();
   private sockets: Set<any> = new Set();
   private socketPlayer: Map<any, string> = new Map();
   private alarmScheduled: boolean = false;
@@ -175,6 +178,16 @@ export class PitthuRoom {
     }
     const phase = this.game.phase;
     if (phase === 'opening' || phase === 'chase' || phase === 'result') {
+      // V2 netcode: inputs are applied ONLY here, at the tick boundary,
+      // in per-player seq order — never on WS arrival. Applying on
+      // arrival made movement depend on network jitter (two inputs 5 ms
+      // apart moved the player by different amounts) and let an action
+      // broadcast overtake the previous tick's state.
+      for (const { playerId, input } of drainInputs(this.inputQueue)) {
+        const pl = this.game.players.find((q: any) => q.id === playerId);
+        if (pl) command(this.game, playerId, sanitizeInput(input, this.game, pl));
+      }
+      this.tick++;
       advance(this.game, Date.now());
       this.revision++;
       this.broadcast();
@@ -197,6 +210,8 @@ export class PitthuRoom {
     const msg = JSON.stringify({
       type: 'state',
       revision: this.revision,
+      tick: this.tick,
+      serverTime: Date.now(),
       state: publicState(this.game),
     });
     for (const ws of [...this.sockets]) {
@@ -427,7 +442,7 @@ export class PitthuRoom {
       server.accept();
       this.sockets.add(server);
       this.socketPlayer.set(server, me.id);
-      this.send(server, { type: 'hello', revision: this.revision, state: publicState(g) });
+      this.send(server, { type: 'hello', revision: this.revision, tick: this.tick, serverTime: Date.now(), state: publicState(g) });
       this.scheduleTick(TICK_MS);
 
       server.addEventListener('message', (event: any) => {
@@ -445,18 +460,16 @@ export class PitthuRoom {
         if (!meNow) return;
         try {
           if (msg.type === 'ping') {
-            this.send(server, { type: 'pong' });
+            this.send(server, { type: 'pong', clientTime: msg.clientTime || 0, serverTime: Date.now() });
           } else if (msg.type === 'input' && msg.input && typeof msg.input === 'object') {
-            // Inputs are applied serially, in arrival order, inside this
-            // one object — no D1 write, no revision check, no 409.
-            // command() itself drops stale/duplicate seq numbers.
-            command(this.game, meNow.id, sanitizeInput(msg.input, this.game, meNow));
-            if (msg.input.action) {
-              // One-shot actions (throw/pass/interact) broadcast at once
-              // instead of waiting up to 33 ms for the next tick.
-              this.revision++;
-              this.broadcast();
-            }
+            // V2 netcode: queue only. The next alarm() tick drains the
+            // queue in seq order and broadcasts once. The old code
+            // applied the input here and broadcast actions immediately,
+            // which could overtake the previous tick's snapshot and made
+            // clients see states out of order. Cost: at most one extra
+            // tick (33 ms) of action latency — worth it for determinism.
+            // command() still drops stale/duplicate seqs at drain time.
+            queueInput(this.inputQueue, meNow.id, msg.input);
           } else if (msg.type === 'op' && typeof msg.op === 'string') {
             const out = this.doOp(msg.op, { ...msg, token: msg.token || token });
             if (out.id) this.socketPlayer.set(server, out.id);

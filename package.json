@@ -12,7 +12,7 @@
     "start": "wrangler dev --config dist/server/wrangler.json --local --persist-to .wrangler/state --ip 127.0.0.1",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
-    "test": "node scripts/test-game.mjs && node scripts/test-regressions.mjs && node scripts/test-realtime.mjs && node scripts/test-assets.mjs"
+    "test": "node scripts/test-game.mjs && node scripts/test-regressions.mjs && node scripts/test-realtime.mjs && node scripts/test-netcode.mjs && node scripts/repro-jitter.mjs && node scripts/test-assets.mjs"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",
